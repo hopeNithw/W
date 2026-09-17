@@ -1,6 +1,7 @@
 import os
 import logging
 import yfinance as yf
+from curl_cffi import requests as curl_requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -30,26 +31,46 @@ logger = logging.getLogger(__name__)
 # برای جلوگیری از اسپم هشدار در یک روز
 already_alerted_today = {"date": None, "alerted": False}
 
+# یاهو فایننس روی سرورهای ابری (از جمله Railway) بعضی وقت‌ها درخواست‌های ساده رو
+# بلاک می‌کنه. با یه سشن curl_cffi که شبیه یه مرورگر واقعی (کروم) رفتار می‌کنه،
+# این مشکل معمولا حل میشه.
+_session = curl_requests.Session(impersonate="chrome")
+
 
 def get_stock_change(symbol: str):
     """
     قیمت لحظه‌ای و درصد تغییر سهم رو نسبت به close روز قبل برمی‌گردونه.
     خروجی: (current_price, prev_close, percent_change) یا None در صورت خطا
     """
+    # روش اول: fast_info
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol, session=_session)
         fast_info = ticker.fast_info
 
         current_price = fast_info["last_price"]
         prev_close = fast_info["previous_close"]
 
-        if not current_price or not prev_close:
+        if current_price and prev_close:
+            percent_change = ((current_price - prev_close) / prev_close) * 100
+            return current_price, prev_close, percent_change
+    except Exception as e:
+        logger.warning(f"روش fast_info شکست خورد، تلاش با history: {e}")
+
+    # روش دوم (پشتیبان): گرفتن قیمت از تاریخچه چند روز اخیر
+    try:
+        ticker = yf.Ticker(symbol, session=_session)
+        hist = ticker.history(period="5d", interval="1d")
+
+        if hist is None or len(hist) < 2:
+            logger.error("داده تاریخچه کافی برای محاسبه تغییر قیمت وجود نداره.")
             return None
 
+        current_price = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
         percent_change = ((current_price - prev_close) / prev_close) * 100
         return current_price, prev_close, percent_change
     except Exception as e:
-        logger.error(f"خطا در دریافت داده سهم: {e}")
+        logger.error("خطا در دریافت داده سهم (هر دو روش شکست خوردند):", exc_info=True)
         return None
 
 
