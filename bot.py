@@ -54,10 +54,12 @@ session.headers.update({"User-Agent": "nvda-telegram-bot/1.0"})
 # STOCK DATA
 # ----------------------------------------------------------------------
 def fetch_stock_data(symbol=None):
-    """Fetch current price and % change vs previous close (no API key needed)."""
+    """Fetch the LIVE price (pre-market / after-hours / regular session,
+    whichever is currently active) and % change vs previous close.
+    No API key needed."""
     symbol = symbol or SYMBOL
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "5m", "range": "1d"}
+    params = {"interval": "1m", "range": "1d", "includePrePost": "true"}
     resp = session.get(url, params=params, timeout=10)
     resp.raise_for_status()
     payload = resp.json()
@@ -67,9 +69,24 @@ def fetch_stock_data(symbol=None):
         raise ValueError(f"No chart data returned for {symbol}")
 
     meta = result_list[0]["meta"]
-    price = meta.get("regularMarketPrice")
     prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
     exchange = meta.get("exchangeName", "NASDAQ")
+    market_state = meta.get("marketState", "REGULAR")  # PRE, REGULAR, POST, CLOSED
+
+    # pick whichever price is actually live right now
+    if market_state == "PRE" and meta.get("preMarketPrice"):
+        price = meta["preMarketPrice"]
+        session_label = "Pre-market"
+    elif market_state == "POST" and meta.get("postMarketPrice"):
+        price = meta["postMarketPrice"]
+        session_label = "After-hours"
+    elif market_state == "REGULAR" and meta.get("regularMarketPrice"):
+        price = meta["regularMarketPrice"]
+        session_label = "Live"
+    else:
+        # market closed and no pre/post tick available -> last known price
+        price = meta.get("regularMarketPrice")
+        session_label = "Closed"
 
     if price is None or prev_close is None:
         raise ValueError(f"Incomplete data returned for {symbol}")
@@ -81,6 +98,7 @@ def fetch_stock_data(symbol=None):
         "exchange": exchange,
         "price": price,
         "pct_change": pct_change,
+        "session": session_label,
         "updated": time.strftime("%H:%M UTC", time.gmtime()),
     }
 
@@ -130,7 +148,7 @@ def handle_message(chat_id, text):
             data = fetch_stock_data()
             sign = "+" if data["pct_change"] >= 0 else ""
             msg = (
-                f"{data['symbol']} \u2022 {data['exchange']}\n"
+                f"{data['symbol']} \u2022 {data['exchange']} \u2022 {data['session']}\n"
                 f"${data['price']:.2f}  ({sign}{data['pct_change']:.2f}%)\n"
                 f"Updated {data['updated']}"
             )
