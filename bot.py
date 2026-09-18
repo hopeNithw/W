@@ -1,162 +1,222 @@
+# -*- coding: utf-8 -*-
+"""
+NVDA Telegram Alert Bot — Railway deployment version
+------------------------------------------------------
+- /nvda -> replies with the current NVDA price and % change (text only)
+- Automatically sends a big warning alert if NVDA drops X% or more
+  from the previous close (default 3%, configurable via env var).
+
+Configuration is done via environment variables (set these in the
+Railway dashboard -> your service -> Variables tab):
+
+    BOT_TOKEN            (required) your Telegram bot token
+    ALERT_DROP_PERCENT   (optional) default 3.0
+    CHECK_INTERVAL        (optional) seconds between price checks, default 60
+
+No hardcoded secrets, no Android-only code — safe to run in any
+standard Linux container.
+"""
+
 import os
+import sys
+import time
 import logging
-import yfinance as yf
-from curl_cffi import requests as curl_requests
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+import requests
 
 # ----------------------------------------------------------------------
-# تنظیمات (از Environment Variables خوانده می‌شوند - در Railway ست کنید)
+# CONFIG (from environment variables)
 # ----------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # آیدی چتی که باید هشدار بهش ارسال بشه
-SYMBOL = os.environ.get("STOCK_SYMBOL", "NVDA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+SYMBOL = os.environ.get("SYMBOL", "NVDA").strip()
+ALERT_DROP_PERCENT = float(os.environ.get("ALERT_DROP_PERCENT", "3.0"))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
+POLL_TIMEOUT = 20  # long-poll timeout for getUpdates, in seconds
 
-# آستانه افت (درصد) - وقتی افت بین این دو مقدار باشه هشدار می‌فرسته
-DROP_MIN = float(os.environ.get("DROP_MIN", "3"))   # حداقل 3 درصد
-DROP_MAX = float(os.environ.get("DROP_MAX", "100")) # عملا بدون سقف بالا (هر افت >=3% هم پوشش داده میشه)
-
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))  # هر 5 دقیقه
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("nvda-bot")
 
-# برای جلوگیری از اسپم هشدار در یک روز
-already_alerted_today = {"date": None, "alerted": False}
+# runtime state for the alert feature (kept in memory)
+_alert_chat_ids = set()
+_alerted = False
 
-# یاهو فایننس روی سرورهای ابری (از جمله Railway) بعضی وقت‌ها درخواست‌های ساده رو
-# بلاک می‌کنه. با یه سشن curl_cffi که شبیه یه مرورگر واقعی (کروم) رفتار می‌کنه،
-# این مشکل معمولا حل میشه.
-_session = curl_requests.Session(impersonate="chrome")
+# a single requests session, reused for connection pooling / retries
+session = requests.Session()
+session.headers.update({"User-Agent": "nvda-telegram-bot/1.0"})
 
 
-def get_stock_change(symbol: str):
-    """
-    قیمت لحظه‌ای و درصد تغییر سهم رو نسبت به close روز قبل برمی‌گردونه.
-    خروجی: (current_price, prev_close, percent_change) یا None در صورت خطا
-    """
-    # روش اول: fast_info
+# ----------------------------------------------------------------------
+# STOCK DATA
+# ----------------------------------------------------------------------
+def fetch_stock_data(symbol=None):
+    """Fetch current price and % change vs previous close (no API key needed)."""
+    symbol = symbol or SYMBOL
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "5m", "range": "1d"}
+    resp = session.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    result_list = payload.get("chart", {}).get("result")
+    if not result_list:
+        raise ValueError(f"No chart data returned for {symbol}")
+
+    meta = result_list[0]["meta"]
+    price = meta.get("regularMarketPrice")
+    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+    exchange = meta.get("exchangeName", "NASDAQ")
+
+    if price is None or prev_close is None:
+        raise ValueError(f"Incomplete data returned for {symbol}")
+
+    pct_change = ((price - prev_close) / prev_close) * 100
+
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "price": price,
+        "pct_change": pct_change,
+        "updated": time.strftime("%H:%M UTC", time.gmtime()),
+    }
+
+
+# ----------------------------------------------------------------------
+# TELEGRAM HELPERS
+# ----------------------------------------------------------------------
+def send_text(chat_id, text):
     try:
-        ticker = yf.Ticker(symbol, session=_session)
-        fast_info = ticker.fast_info
-
-        current_price = fast_info["last_price"]
-        prev_close = fast_info["previous_close"]
-
-        if current_price and prev_close:
-            percent_change = ((current_price - prev_close) / prev_close) * 100
-            return current_price, prev_close, percent_change
-    except Exception as e:
-        logger.warning(f"روش fast_info شکست خورد، تلاش با history: {e}")
-
-    # روش دوم (پشتیبان): گرفتن قیمت از تاریخچه چند روز اخیر
-    try:
-        ticker = yf.Ticker(symbol, session=_session)
-        hist = ticker.history(period="5d", interval="1d")
-
-        if hist is None or len(hist) < 2:
-            logger.error("داده تاریخچه کافی برای محاسبه تغییر قیمت وجود نداره.")
-            return None
-
-        current_price = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2])
-        percent_change = ((current_price - prev_close) / prev_close) * 100
-        return current_price, prev_close, percent_change
-    except Exception as e:
-        logger.error("خطا در دریافت داده سهم (هر دو روش شکست خوردند):", exc_info=True)
-        return None
-
-
-def format_message(symbol, current_price, prev_close, percent_change):
-    arrow = "🔻" if percent_change < 0 else "🔺"
-    return (
-        f"{arrow} سهام {symbol}\n\n"
-        f"قیمت فعلی: {current_price:.2f}$\n"
-        f"قیمت بسته‌شدن قبلی: {prev_close:.2f}$\n"
-        f"تغییر: {percent_change:.2f}%"
-    )
-
-
-# ----------------------------------------------------------------------
-# دستورات ربات
-# ----------------------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "سلام! ربات رصد سهام روشنه.\n\n"
-        f"سهم تحت نظر: {SYMBOL}\n"
-        f"دستور /check رو بفرست تا وضعیت لحظه‌ای رو ببینی.\n\n"
-        f"چت آیدی شما: {update.effective_chat.id}\n"
-        "(اگه می‌خوای هشدارها به همین چت ارسال بشه، این عدد رو در متغیر "
-        "TELEGRAM_CHAT_ID در Railway ست کن)"
-    )
-
-
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = get_stock_change(SYMBOL)
-    if result is None:
-        await update.message.reply_text("⚠️ در حال حاضر نمی‌تونم قیمت رو دریافت کنم. دوباره تلاش کن.")
-        return
-
-    current_price, prev_close, percent_change = result
-    await update.message.reply_text(format_message(SYMBOL, current_price, prev_close, percent_change))
-
-
-# ----------------------------------------------------------------------
-# چک دوره‌ای پس‌زمینه برای هشدار افت قیمت
-# ----------------------------------------------------------------------
-async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
-    if not CHAT_ID:
-        return  # اگه چت آیدی ست نشده، هشداری ارسال نمیشه
-
-    result = get_stock_change(SYMBOL)
-    if result is None:
-        return
-
-    current_price, prev_close, percent_change = result
-
-    import datetime
-    today = datetime.date.today().isoformat()
-
-    # ریست کردن وضعیت هشدار در ابتدای هر روز جدید
-    if already_alerted_today["date"] != today:
-        already_alerted_today["date"] = today
-        already_alerted_today["alerted"] = False
-
-    drop = -percent_change  # اگه سهم افت کرده باشه، این عدد مثبت میشه
-
-    if DROP_MIN <= drop <= DROP_MAX and not already_alerted_today["alerted"]:
-        text = (
-            "🚨 هشدار افت قیمت سهام!\n\n"
-            + format_message(SYMBOL, current_price, prev_close, percent_change)
+        r = session.post(
+            f"{API_BASE}/sendMessage",
+            data={"chat_id": chat_id, "text": text},
+            timeout=15,
         )
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
-        already_alerted_today["alerted"] = True
-        logger.info(f"هشدار ارسال شد. افت: {drop:.2f}%")
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        log.warning("Failed to send message to %s: %s", chat_id, e)
 
 
+def get_updates(offset=None):
+    params = {"timeout": POLL_TIMEOUT}
+    if offset is not None:
+        params["offset"] = offset
+    r = session.get(f"{API_BASE}/getUpdates", params=params, timeout=POLL_TIMEOUT + 10)
+    r.raise_for_status()
+    return r.json().get("result", [])
+
+
+# ----------------------------------------------------------------------
+# COMMAND HANDLING
+# ----------------------------------------------------------------------
+def handle_message(chat_id, text):
+    _alert_chat_ids.add(chat_id)
+    text = (text or "").strip().lower()
+
+    if text in ("/start", "/help"):
+        send_text(
+            chat_id,
+            f"Send /{SYMBOL.lower()} to get the latest price.\n"
+            f"You'll also get an automatic \U0001F6A8 alert if {SYMBOL} "
+            f"drops {ALERT_DROP_PERCENT:.1f}%+ from the previous close.",
+        )
+        return
+
+    if text.startswith(f"/{SYMBOL.lower()}") or text.startswith("/nvda"):
+        try:
+            data = fetch_stock_data()
+            sign = "+" if data["pct_change"] >= 0 else ""
+            msg = (
+                f"{data['symbol']} \u2022 {data['exchange']}\n"
+                f"${data['price']:.2f}  ({sign}{data['pct_change']:.2f}%)\n"
+                f"Updated {data['updated']}"
+            )
+            send_text(chat_id, msg)
+        except Exception as e:
+            log.exception("Failed to fetch stock data")
+            send_text(chat_id, f"Error fetching {SYMBOL} data: {e}")
+
+
+def check_crash_alert():
+    """Check the price drop and blast an alert to all known chats if triggered."""
+    global _alerted
+
+    if not _alert_chat_ids:
+        return  # nobody has talked to the bot yet
+
+    try:
+        data = fetch_stock_data()
+    except Exception as e:
+        log.warning("Alert check failed: %s", e)
+        return
+
+    drop = -data["pct_change"]  # positive number = how much it has dropped
+
+    if drop >= ALERT_DROP_PERCENT and not _alerted:
+        alert_msg = (
+            "\U0001F6A8\U0001F6A8\U0001F6A8 \u0647\u0634\u062f\u0627\u0631! "
+            "\u0633\u0642\u0648\u0637 \u0634\u062f\u06cc\u062f \u0633\u0647\u0627\u0645 "
+            "\U0001F6A8\U0001F6A8\U0001F6A8\n"
+            f"\U0001F4C9\U0001F4C9\U0001F4C9 {data['symbol']} \u0627\u0641\u062a \u06a9\u0631\u062f! "
+            "\U0001F4C9\U0001F4C9\U0001F4C9\n\n"
+            f"\u26A0\uFE0F \u0642\u06CC\u0645\u062A: ${data['price']:.2f}\n"
+            f"\U0001F53B \u062A\u063A\u06CC\u06CC\u0631: {data['pct_change']:.2f}%\n"
+            f"\U0001F551 \u0633\u0627\u0639\u062A: {data['updated']}\n\n"
+            "\U0001F6D1 \u0645\u0631\u0627\u0642\u0628 \u0628\u0627\u0632\u0627\u0631 \u0628\u0627\u0634!"
+        )
+        for cid in list(_alert_chat_ids):
+            send_text(cid, alert_msg)
+        _alerted = True
+        log.info("Crash alert sent (drop=%.2f%%)", drop)
+
+    elif drop < ALERT_DROP_PERCENT - 1:
+        # price recovered a bit -> re-arm so a future drop can trigger again
+        if _alerted:
+            log.info("Price recovered, re-arming alert")
+        _alerted = False
+
+
+# ----------------------------------------------------------------------
+# MAIN LOOP
+# ----------------------------------------------------------------------
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("متغیر TELEGRAM_BOT_TOKEN ست نشده است.")
+        log.error("BOT_TOKEN environment variable is not set. Exiting.")
+        sys.exit(1)
 
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("check", check))
-
-    # چک دوره‌ای هر CHECK_INTERVAL_SECONDS ثانیه
-    application.job_queue.run_repeating(
-        periodic_check, interval=CHECK_INTERVAL_SECONDS, first=10
+    log.info(
+        "Bot starting. symbol=%s alert_drop=%.1f%% check_interval=%ss",
+        SYMBOL, ALERT_DROP_PERCENT, CHECK_INTERVAL,
     )
 
-    logger.info("ربات در حال اجراست...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    offset = None
+    last_check = 0.0
+
+    while True:
+        try:
+            updates = get_updates(offset)
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                handle_message(chat_id, msg.get("text", ""))
+
+            if time.time() - last_check >= CHECK_INTERVAL:
+                check_crash_alert()
+                last_check = time.time()
+
+        except requests.exceptions.RequestException as e:
+            log.warning("Network error, retrying in 5s: %s", e)
+            time.sleep(5)
+        except Exception:
+            # never let an unexpected error kill the whole process on Railway
+            log.exception("Unexpected error in main loop, continuing")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
