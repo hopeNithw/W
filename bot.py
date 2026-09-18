@@ -9,9 +9,11 @@ NVDA Telegram Alert Bot — Railway deployment version
 Configuration is done via environment variables (set these in the
 Railway dashboard -> your service -> Variables tab):
 
-    BOT_TOKEN            (required) your Telegram bot token
-    ALERT_DROP_PERCENT   (optional) default 3.0
+    BOT_TOKEN             (required) your Telegram bot token
+    ALERT_DROP_PERCENT    (optional) default 3.0
     CHECK_INTERVAL        (optional) seconds between price checks, default 60
+    CACHE_TTL             (optional) seconds to cache the last price, default 15
+                           (protects against Yahoo Finance rate limiting / 429s)
 
 No hardcoded secrets, no Android-only code — safe to run in any
 standard Linux container.
@@ -53,16 +55,76 @@ session.headers.update({"User-Agent": "nvda-telegram-bot/1.0"})
 # ----------------------------------------------------------------------
 # STOCK DATA
 # ----------------------------------------------------------------------
-def fetch_stock_data(symbol=None):
+_YAHOO_HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
+
+# simple in-memory cache so rapid repeated /nvda commands (or the alert
+# checker) don't hammer Yahoo and trigger rate limiting (HTTP 429)
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "15"))  # seconds
+_cache = {"data": None, "ts": 0.0}
+
+
+def _fetch_stock_data_raw(symbol):
+    """One real network call to Yahoo Finance, with retry/backoff on
+    429 (rate limited) and 5xx errors, and host rotation."""
+    params = {"interval": "1m", "range": "1d", "includePrePost": "true"}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    last_error = None
+    delay = 1.5
+    attempts = 4
+
+    for attempt in range(attempts):
+        host = _YAHOO_HOSTS[attempt % len(_YAHOO_HOSTS)]
+        url = f"https://{host}/v8/finance/chart/{symbol}"
+        try:
+            resp = session.get(url, params=params, headers=headers, timeout=10)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = requests.exceptions.HTTPError(
+                    f"{resp.status_code} from {host}"
+                )
+                log.warning(
+                    "Yahoo returned %s (attempt %d/%d), backing off %.1fs",
+                    resp.status_code, attempt + 1, attempts, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            log.warning("Fetch attempt %d/%d failed: %s", attempt + 1, attempts, e)
+            time.sleep(delay)
+            delay *= 2
+
+    raise last_error or RuntimeError("Failed to fetch stock data")
+
+
+def fetch_stock_data(symbol=None, use_cache=True):
     """Fetch the LIVE price (pre-market / after-hours / regular session,
     whichever is currently active) and % change vs previous close.
-    No API key needed."""
+    Cached for CACHE_TTL seconds to avoid rate limiting. No API key needed."""
     symbol = symbol or SYMBOL
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "1m", "range": "1d", "includePrePost": "true"}
-    resp = session.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    payload = resp.json()
+
+    now = time.time()
+    if use_cache and _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL:
+        return _cache["data"]
+
+    try:
+        payload = _fetch_stock_data_raw(symbol)
+    except Exception:
+        # if we have a slightly stale cached value, prefer that over an error
+        if _cache["data"] is not None:
+            log.warning("Live fetch failed, serving last cached price instead")
+            return _cache["data"]
+        raise
 
     result_list = payload.get("chart", {}).get("result")
     if not result_list:
@@ -93,7 +155,7 @@ def fetch_stock_data(symbol=None):
 
     pct_change = ((price - prev_close) / prev_close) * 100
 
-    return {
+    data = {
         "symbol": symbol,
         "exchange": exchange,
         "price": price,
@@ -101,6 +163,9 @@ def fetch_stock_data(symbol=None):
         "session": session_label,
         "updated": time.strftime("%H:%M UTC", time.gmtime()),
     }
+    _cache["data"] = data
+    _cache["ts"] = now
+    return data
 
 
 # ----------------------------------------------------------------------
